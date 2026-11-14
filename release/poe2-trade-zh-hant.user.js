@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PoE 2 國際市集詞綴繁中
 // @namespace    exile-ai.poe2-trade.zh-hant
-// @version      0.1.15
+// @version      0.1.16
 // @description  PoE 2 國際市集與 FilterBlade 繁中化，支援國際市集原生繁中搜尋。
 // @match        https://www.pathofexile.com/trade2/search/*
 // @match        https://pathofexile.com/trade2/search/*
@@ -1045,15 +1045,34 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
   const tierStatusClass = 'poe2-trade-tier-status';
   const tierFilterGroups = '.search-advanced-items:not(.exchange) .search-advanced-pane.brown > .filter-group';
   const tierResultRows = '.resultset:not(.exchange) > .row[data-id]:not(.error)';
+  const tierLabels = '.item-mod > .lc.l';
+  
+  function affixTier(text) {
+    const match = text.match(/^\s*(?:\+\s*)?(?:P|S|前T|后T)(\d+)\s*$/u);
+    if (match) return Number(match[1]);
+  }
+  
+  function observedAffixTiers(modifiers) {
+    const byStat = new Map();
+    for (const { field, tiers } of modifiers) {
+      const id = field?.startsWith('stat.') && field.slice(5);
+      if (!id || !tierStatId.test(id)) continue;
+      const ranks = byStat.get(id) ?? new Set();
+      for (const text of tiers) {
+        const rank = affixTier(text);
+        if (rank !== undefined) ranks.add(rank);
+      }
+      if (ranks.size) byStat.set(id, ranks);
+    }
+    return byStat;
+  }
   
   function meetsAffixTiers(conditions, modifiers) {
     return conditions.every(({ id, selection }) => {
       const [mode, value] = selection.split(':');
       const rank = Number(value);
       return modifiers.some(({ field, tiers }) => field === 'stat.' + id && tiers.some(text => {
-        const match = text.match(/^\s*(?:\+\s*)?(?:P|S|前T|后T)(\d+)\s*$/u);
-        if (!match) return false;
-        const tier = Number(match[1]);
+        const tier = affixTier(text);
         return mode === 'exact' ? tier === rank : tier > 0 && tier <= rank;
       }));
     });
@@ -1064,6 +1083,7 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
     if (!root) return;
     const byGroup = new WeakMap();
     const bySearch = new Map();
+    const controlOptions = new WeakMap();
     let store;
     let pending = false;
     let existingStatus;
@@ -1074,7 +1094,29 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
       return selections;
     }
   
-    function syncControls(groups) {
+    function syncOptions(select, observed, selected) {
+      const exact = [...(observed ?? [])].sort((a, b) => a - b);
+      const best = exact.filter(tier => tier > 1);
+      const signature = JSON.stringify([exact, selected]);
+      if (controlOptions.get(select) === signature) return;
+      controlOptions.set(select, signature);
+      select.replaceChildren(new Option(exact.length || selected ? '不限階級' : '先搜尋以取得階級', ''));
+      for (const [label, mode, ranks] of [['指定階級', 'exact', exact], ['此階級或更好', 'best', best]]) {
+        if (!ranks.length) continue;
+        const options = document.createElement('optgroup');
+        options.label = label;
+        for (const tier of ranks) {
+          options.append(new Option(mode === 'exact' ? `T${tier}` : `T1–T${tier}`, `${mode}:${tier}`));
+        }
+        select.append(options);
+      }
+      if (selected && ![...select.options].some(option => option.value === selected)) {
+        const [mode, rank] = selected.split(':');
+        select.add(new Option(mode === 'exact' ? `T${rank}（已選）` : `T1–T${rank}（已選）`, selected));
+      }
+    }
+  
+    function syncControls(groups, observed) {
       const panels = [...root.querySelectorAll(tierFilterGroups)];
       if (panels.length !== groups.length) return;
       for (const [index, group] of groups.entries()) {
@@ -1092,68 +1134,74 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
           if (!control) {
             select.className = 'form-control ' + tierControlClass;
             select.setAttribute('aria-label', '詞綴階級');
-            select.title = '按市集詞綴階級篩選已載入的商品。選好後按搜尋。';
-            select.add(new Option('不限階級', ''));
-            for (const [label, mode, first] of [['指定階級', 'exact', 0], ['此階級或更好', 'best', 2]]) {
-              const options = document.createElement('optgroup');
-              options.label = label;
-              for (let tier = first; tier <= 20; tier++) {
-                options.append(new Option(mode === 'exact' ? `T${tier}` : `T1–T${tier}`, `${mode}:${tier}`));
-              }
-              select.append(options);
-            }
+            select.title = '選單列出已載入商品中這條詞綴的實際階級。';
             row.querySelector(':scope > .filter-body')?.append(select);
           }
-          select.disabled = Boolean(group.disabled || filter.disabled || store.state.transient.search.active?.live);
-          select.value = selections.get(filter.id) ?? '';
+          const ranks = observed.get(filter.id);
+          const selected = selections.get(filter.id) ?? '';
+          syncOptions(select, ranks, selected);
+          select.disabled = Boolean((!ranks?.size && !selected) || group.disabled || filter.disabled || store.state.transient.search.active?.live);
+          select.value = selected;
           select.onchange = () => {
             if (select.value) selections.set(filter.id, select.value);
             else selections.delete(filter.id);
-            // A repeated native stat row has the same trade ID and tier requirement.
+            const { active } = store.state.transient.search;
+            if (active?.type === 'search' && !active.live) bySearch.set(active.localId, selectedConditions(groups));
             schedule();
           };
         }
       }
     }
   
-    function syncResults(active) {
+    function readResultModifiers() {
+      return [...root.querySelectorAll(tierResultRows)].map(row => ({
+        row,
+        modifiers: [...row.querySelectorAll(tierLabels)].map(tier => ({
+          field: tier.parentElement.firstElementChild?.getAttribute('data-field'),
+          tiers: [...tier.childNodes].filter(node => node.nodeType === Node.TEXT_NODE).map(node => node.data)
+        }))
+      }));
+    }
+  
+    function syncResults(active, rows) {
       const conditions = active?.type === 'search' ? bySearch.get(active.localId) ?? [] : [];
       if (!conditions.length) {
         for (const row of root.querySelectorAll('.' + tierHiddenClass)) row.classList.remove(tierHiddenClass);
         existingStatus?.remove();
         return;
       }
-      const rows = [...root.querySelectorAll(tierResultRows)];
       let matched = 0;
-      for (const row of rows) {
-        const modifiers = [...row.querySelectorAll('.item-mod > .lc.l')].map(tier => ({
-          field: tier.parentElement.firstElementChild?.getAttribute('data-field'),
-          tiers: [...tier.childNodes].filter(node => node.nodeType === Node.TEXT_NODE).map(node => node.data)
-        }));
+      for (const { row, modifiers } of rows) {
         const visible = meetsAffixTiers(conditions, modifiers);
         row.classList.toggle(tierHiddenClass, !visible);
         if (visible) matched++;
       }
       const summary = root.querySelector('.results .row-total');
-      if (!summary) return;
+      if (!summary) {
+        existingStatus?.remove();
+        return;
+      }
       if (!existingStatus) {
         existingStatus = document.createElement('span');
         existingStatus.className = tierStatusClass;
         existingStatus.setAttribute('role', 'status');
       }
-      if (existingStatus.parentElement !== summary) summary.append(existingStatus);
-      const message = `T階篩選（已載入）${matched}／${rows.length} 符合`;
+      if (existingStatus.previousElementSibling !== summary) summary.after(existingStatus);
+      const message = `T 階篩選：已載入 ${rows.length} 筆，符合 ${matched} 筆`;
       if (existingStatus.textContent !== message) existingStatus.textContent = message;
+    }
+  
+    function selectedConditions(groups) {
+      return groups.filter(group => group.type === 'and' && !group.disabled)
+        .flatMap(group => group.filters.filter(filter => !filter.disabled && tierStatId.test(filter.id))
+          .map(filter => ({ id: filter.id, selection: byGroup.get(group)?.get(filter.id) }))
+          .filter(({ selection }) => selection));
     }
   
     function onMutation({ type, payload }, state) {
       if (type === 'addSearchQuery' && payload.type === 'search') {
         const active = state.transient.search.active;
-        const conditions = payload.live ? bySearch.get(active?.localId) ?? [] : state.persistent.stats
-          .filter(group => group.type === 'and' && !group.disabled)
-          .flatMap(group => group.filters.filter(filter => !filter.disabled && tierStatId.test(filter.id))
-            .map(filter => ({ id: filter.id, selection: byGroup.get(group)?.get(filter.id) }))
-            .filter(({ selection }) => selection));
+        const conditions = payload.live ? bySearch.get(active?.localId) ?? [] : selectedConditions(state.persistent.stats);
         bySearch.set(payload.localId, conditions);
       }
       if (type === 'removeCurrentSearch' || type === 'addSearchQuery') {
@@ -1175,8 +1223,11 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
           store.subscribe(onMutation);
         }
         const { persistent, transient } = store.state;
-        if (persistent.tab === 'search') syncControls(persistent.stats);
-        syncResults(transient.search.active);
+        const hasTierFilters = persistent.tab === 'search' && persistent.stats.some(group =>
+          group.type === 'and' && group.filters.some(filter => tierStatId.test(filter.id)));
+        const rows = hasTierFilters || bySearch.get(transient.search.active?.localId)?.length ? readResultModifiers() : [];
+        if (persistent.tab === 'search') syncControls(persistent.stats, observedAffixTiers(rows.flatMap(row => row.modifiers)));
+        syncResults(transient.search.active, rows);
       });
     }
   
@@ -1711,7 +1762,10 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
         display: block; width: auto; max-width: 100%; margin: 4px 0 2px auto; padding: 0 5px;
         height: 25px; color: #e0d1b4; background: #171510; border: 1px solid #655339;
       }
-      #trade .${tierStatusClass} { margin: 0 8px; color: #e0d1b4; font-size: 0.9em; }
+      #trade .results > .${tierStatusClass} {
+        display: block; clear: both; margin: 4px 8px 8px; color: #e0d1b4; font-size: 0.9em;
+        white-space: normal; overflow-wrap: anywhere;
+      }
     `;
     document.head.append(style);
     installAffixTierFilters();
