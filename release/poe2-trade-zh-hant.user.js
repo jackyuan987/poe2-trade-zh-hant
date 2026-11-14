@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PoE 2 國際市集詞綴繁中
 // @namespace    exile-ai.poe2-trade.zh-hant
-// @version      0.1.14
+// @version      0.1.15
 // @description  PoE 2 國際市集與 FilterBlade 繁中化，支援國際市集原生繁中搜尋。
 // @match        https://www.pathofexile.com/trade2/search/*
 // @match        https://pathofexile.com/trade2/search/*
@@ -1038,6 +1038,153 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
     const effects = createResultTranslator(Object.fromEntries(rows.map(([name, , effects]) => [name, effects])));
     return { name: text => names.get(text), effect: effects };
   }
+  
+  const tierStatId = /^(?:explicit|fractured|crafted|desecrated)\.stat_\d+(?:\|\d+)?$/u;
+  const tierControlClass = 'poe2-trade-tier-control';
+  const tierHiddenClass = 'poe2-trade-tier-hidden';
+  const tierStatusClass = 'poe2-trade-tier-status';
+  const tierFilterGroups = '.search-advanced-items:not(.exchange) .search-advanced-pane.brown > .filter-group';
+  const tierResultRows = '.resultset:not(.exchange) > .row[data-id]:not(.error)';
+  
+  function meetsAffixTiers(conditions, modifiers) {
+    return conditions.every(({ id, selection }) => {
+      const [mode, value] = selection.split(':');
+      const rank = Number(value);
+      return modifiers.some(({ field, tiers }) => field === 'stat.' + id && tiers.some(text => {
+        const match = text.match(/^\s*(?:\+\s*)?(?:P|S|前T|后T)(\d+)\s*$/u);
+        if (!match) return false;
+        const tier = Number(match[1]);
+        return mode === 'exact' ? tier === rank : tier > 0 && tier <= rank;
+      }));
+    });
+  }
+  
+  function installAffixTierFilters() {
+    const root = document.querySelector('#trade');
+    if (!root) return;
+    const byGroup = new WeakMap();
+    const bySearch = new Map();
+    let store;
+    let pending = false;
+    let existingStatus;
+  
+    function groupSelections(group) {
+      let selections = byGroup.get(group);
+      if (!selections) byGroup.set(group, selections = new Map());
+      return selections;
+    }
+  
+    function syncControls(groups) {
+      const panels = [...root.querySelectorAll(tierFilterGroups)];
+      if (panels.length !== groups.length) return;
+      for (const [index, group] of groups.entries()) {
+        const rows = [...panels[index].querySelectorAll(':scope > .filter-group-body > .filter.full-span')];
+        const selections = groupSelections(group);
+        for (const id of selections.keys()) if (!group.filters.some(filter => filter.id === id)) selections.delete(id);
+        for (const [position, row] of rows.entries()) {
+          const filter = group.filters[position];
+          const control = row.querySelector('.' + tierControlClass);
+          if (!filter || group.type !== 'and' || !tierStatId.test(filter.id)) {
+            control?.remove();
+            continue;
+          }
+          const select = control ?? document.createElement('select');
+          if (!control) {
+            select.className = 'form-control ' + tierControlClass;
+            select.setAttribute('aria-label', '詞綴階級');
+            select.title = '按市集詞綴階級篩選已載入的商品。選好後按搜尋。';
+            select.add(new Option('不限階級', ''));
+            for (const [label, mode, first] of [['指定階級', 'exact', 0], ['此階級或更好', 'best', 2]]) {
+              const options = document.createElement('optgroup');
+              options.label = label;
+              for (let tier = first; tier <= 20; tier++) {
+                options.append(new Option(mode === 'exact' ? `T${tier}` : `T1–T${tier}`, `${mode}:${tier}`));
+              }
+              select.append(options);
+            }
+            row.querySelector(':scope > .filter-body')?.append(select);
+          }
+          select.disabled = Boolean(group.disabled || filter.disabled || store.state.transient.search.active?.live);
+          select.value = selections.get(filter.id) ?? '';
+          select.onchange = () => {
+            if (select.value) selections.set(filter.id, select.value);
+            else selections.delete(filter.id);
+            // A repeated native stat row has the same trade ID and tier requirement.
+            schedule();
+          };
+        }
+      }
+    }
+  
+    function syncResults(active) {
+      const conditions = active?.type === 'search' ? bySearch.get(active.localId) ?? [] : [];
+      if (!conditions.length) {
+        for (const row of root.querySelectorAll('.' + tierHiddenClass)) row.classList.remove(tierHiddenClass);
+        existingStatus?.remove();
+        return;
+      }
+      const rows = [...root.querySelectorAll(tierResultRows)];
+      let matched = 0;
+      for (const row of rows) {
+        const modifiers = [...row.querySelectorAll('.item-mod > .lc.l')].map(tier => ({
+          field: tier.parentElement.firstElementChild?.getAttribute('data-field'),
+          tiers: [...tier.childNodes].filter(node => node.nodeType === Node.TEXT_NODE).map(node => node.data)
+        }));
+        const visible = meetsAffixTiers(conditions, modifiers);
+        row.classList.toggle(tierHiddenClass, !visible);
+        if (visible) matched++;
+      }
+      const summary = root.querySelector('.results .row-total');
+      if (!summary) return;
+      if (!existingStatus) {
+        existingStatus = document.createElement('span');
+        existingStatus.className = tierStatusClass;
+        existingStatus.setAttribute('role', 'status');
+      }
+      if (existingStatus.parentElement !== summary) summary.append(existingStatus);
+      const message = `T階篩選（已載入）${matched}／${rows.length} 符合`;
+      if (existingStatus.textContent !== message) existingStatus.textContent = message;
+    }
+  
+    function onMutation({ type, payload }, state) {
+      if (type === 'addSearchQuery' && payload.type === 'search') {
+        const active = state.transient.search.active;
+        const conditions = payload.live ? bySearch.get(active?.localId) ?? [] : state.persistent.stats
+          .filter(group => group.type === 'and' && !group.disabled)
+          .flatMap(group => group.filters.filter(filter => !filter.disabled && tierStatId.test(filter.id))
+            .map(filter => ({ id: filter.id, selection: byGroup.get(group)?.get(filter.id) }))
+            .filter(({ selection }) => selection));
+        bySearch.set(payload.localId, conditions);
+      }
+      if (type === 'removeCurrentSearch' || type === 'addSearchQuery') {
+        const remaining = new Set(state.transient.searches.map(search => search.localId));
+        for (const id of bySearch.keys()) if (!remaining.has(id)) bySearch.delete(id);
+      }
+      schedule();
+    }
+  
+    function schedule() {
+      if (pending) return;
+      pending = true;
+      requestAnimationFrame(() => {
+        pending = false;
+        const nextStore = window.app?.$store;
+        if (!nextStore) return;
+        if (!store) {
+          store = nextStore;
+          store.subscribe(onMutation);
+        }
+        const { persistent, transient } = store.state;
+        if (persistent.tab === 'search') syncControls(persistent.stats);
+        syncResults(transient.search.active);
+      });
+    }
+  
+    new MutationObserver(schedule).observe(root, {
+      childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['data-field']
+    });
+    schedule();
+  }
 
   const names = catalog.names;
   const uiLabels = { ...names.labels, ...names.exchangeLabels };
@@ -1159,6 +1306,7 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
   const modifierEffectSelector = '.item-mod > .lc:first-child';
   const translateModifierLabel = createModifierLabelTranslator(names);
   const modifierLabelSelector = '.item-mod > .lc.r > .d';
+  const modifierTierSelector = '.resultset .row .item-mod > .lc.l';
   const modifierLabelState = new WeakMap();
   let translateNotable;
   const notableState = new WeakMap();
@@ -1179,7 +1327,7 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
     '.resultset .load-more-btn > span', '.results .row-total > h3', '.toast-message', '.toast-title',
     '#trade :is(a,button)'
   ].join(', ');
-  const watched = [fieldSelector, modifierLabelSelector, itemSelector, propertySelector, itemFlagSelector, notableSelector, priceNoteSelector, flavourSelector,
+  const watched = [fieldSelector, modifierLabelSelector, modifierTierSelector, itemSelector, propertySelector, itemFlagSelector, notableSelector, priceNoteSelector, flavourSelector,
     controlSelector, attributeSelector, listingSelector, exchangeSelector].join(', ');
   const itemState = new WeakMap();
   const maintenanceSkip = 'script, style, textarea, .search-panel, .resultset';
@@ -1244,6 +1392,16 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
     if (display !== english) modifierLabelState.set(element, { english, display });
     else modifierLabelState.delete(element);
     if (display !== current) element.textContent = display;
+  }
+
+  function renderModifierTier(element) {
+    for (const node of element.childNodes) {
+      if (node.nodeType !== Node.TEXT_NODE) continue;
+      const original = node.data;
+      const translated = original.replace(/^(\s*(?:\+\s*)?)([PS])(\d+)(\s*)$/u,
+        (_, separator, kind, tier, whitespace) => `${separator}${kind === 'P' ? '前' : '后'}T${tier}${whitespace}`);
+      if (translated !== original) node.data = translated;
+    }
   }
 
   function translateControl(element) {
@@ -1427,6 +1585,7 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
   function renderNode(element) {
     if (element.matches(fieldSelector)) renderResult(element);
     else if (element.matches(modifierLabelSelector)) renderModifierLabel(element);
+    else if (element.matches(modifierTierSelector)) renderModifierTier(element);
     else if (element.matches(itemSelector)) renderItemName(element);
     else if (element.matches(propertySelector)) renderProperty(element);
     else if (element.matches(notableSelector)) renderNotable(element);
@@ -1547,8 +1706,15 @@ html[data-fbzh-on] [id^="VisualDivEntryVisuals"] > .VisualItem_OuterContainer {d
       }
       .${resultClass} { display: block; white-space: pre-line; }
       .${hiddenClass} > :is(span:not(.${resultClass}), br) { display: none !important; }
+      .${tierHiddenClass} { display: none !important; }
+      #trade .${tierControlClass} {
+        display: block; width: auto; max-width: 100%; margin: 4px 0 2px auto; padding: 0 5px;
+        height: 25px; color: #e0d1b4; background: #171510; border: 1px solid #655339;
+      }
+      #trade .${tierStatusClass} { margin: 0 8px; color: #e0d1b4; font-size: 0.9em; }
     `;
     document.head.append(style);
+    installAffixTierFilters();
 
     for (const element of document.querySelectorAll(watched)) renderNode(element);
     scanMaintenance(document.body);
