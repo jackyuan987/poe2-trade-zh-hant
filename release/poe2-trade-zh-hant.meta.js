@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PoE 2 國際市集詞綴繁中
 // @namespace    exile-ai.poe2-trade.zh-hant
-// @version      0.1.12
-// @description  國際服 PoE 2 市集物品名稱、詞綴與篩選介面繁中化，支援原生繁中搜尋。
+// @version      0.1.13
+// @description  PoE 2 國際市集與 FilterBlade 繁中化，支援國際市集原生繁中搜尋。
 // @match        https://www.pathofexile.com/trade2/search/*
 // @match        https://pathofexile.com/trade2/search/*
 // @match        https://www.pathofexile.com/trade2/exchange/*
@@ -11,6 +11,8 @@
 // @match        https://pathofexile.com/trade2/exchange
 // @match        https://www.pathofexile.com/trade2
 // @match        https://pathofexile.com/trade2
+// @match        https://www.filterblade.xyz/*
+// @match        https://filterblade.xyz/*
 // @run-at       document-start
 // @sandbox      raw
 // @grant        none
